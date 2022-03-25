@@ -39,6 +39,10 @@ path = "../matrix-sdk-sled"
 default_features = false
 features = ["crypto-store"]
 
+[dependencies.vodozemac]
+git = "https://github.com/matrix-org/vodozemac"
+rev = "16fb254aa3325c61ef949314c81c35f91d0664e1"
+
 [dependencies.tokio]
 version = "1.7.1"
 default_features = false

@@ -1,9 +1,9 @@
-#![warn(missing_docs)]
-
 //! Uniffi based bindings for the `matrix-sdk-crypto` crate.
 //!
 //! This crate can be used to introduce E2EE support into an existing Matrix
 //! client or client library in any of the language targets Uniffi supports.
+
+#![warn(missing_docs)]
 
 mod backup_recovery_key;
 mod device;
@@ -14,7 +14,7 @@ mod responses;
 mod users;
 mod verification;
 
-use std::convert::TryFrom;
+use std::{collections::HashMap, convert::TryFrom, sync::Arc};
 
 pub use backup_recovery_key::{
     BackupRecoveryKey, DecodeError, MegolmV1BackupKey, PassphraseInfo, PkDecryptionError,
@@ -25,15 +25,203 @@ pub use error::{
 };
 pub use logger::{set_logger, Logger};
 pub use machine::{KeyRequestPair, OlmMachine};
+use matrix_sdk_common::instant::Instant;
 pub use responses::{
     BootstrapCrossSigningResult, DeviceLists, KeysImportResult, OutgoingVerificationRequest,
     Request, RequestType, SignatureUploadRequest, UploadSigningKeysRequest,
 };
+use ruma::{DeviceId, DeviceKeyAlgorithm, RoomId, UserId};
 pub use users::UserIdentity;
 pub use verification::{
     CancelInfo, ConfirmVerificationResult, QrCode, RequestVerificationResult, Sas, ScanResult,
     StartSasResult, Verification, VerificationRequest,
 };
+
+/// TODO
+pub struct MigrationData {
+    account: PickledAccount,
+    sessions: Vec<PickledSession>,
+    inbound_group_sessions: Vec<PickledInboundGroupSession>,
+    pickle_key: String,
+    backup_version: Option<String>,
+    backup_recovery_key: Option<String>,
+}
+
+/// A pickled version of an `Account`.
+///
+/// Holds all the information that needs to be stored in a database to restore
+/// an account.
+pub struct PickledAccount {
+    /// The user id of the account owner.
+    pub user_id: String,
+    /// The device id of the account owner.
+    pub device_id: String,
+    /// The pickled version of the Olm account.
+    pub pickle: String,
+    /// Was the account shared.
+    pub shared: bool,
+    /// The number of uploaded one-time keys we have on the server.
+    pub uploaded_signed_key_count: i64,
+}
+
+/// A pickled version of a `Session`.
+///
+/// Holds all the information that needs to be stored in a database to restore
+/// a Session.
+pub struct PickledSession {
+    /// The pickle string holding the Olm Session.
+    pub pickle: String,
+    /// The curve25519 key of the other user that we share this session with.
+    pub sender_key: String,
+    /// Was the session created using a fallback key.
+    pub created_using_fallback_key: bool,
+    /// The relative time elapsed since the session was created.
+    pub creation_time: String,
+    /// The relative time elapsed since the session was last used.
+    pub last_use_time: String,
+}
+
+/// A pickled version of an `InboundGroupSession`.
+///
+/// Holds all the information that needs to be stored in a database to restore
+/// an InboundGroupSession.
+pub struct PickledInboundGroupSession {
+    /// The pickle string holding the InboundGroupSession.
+    pub pickle: String,
+    /// The public curve25519 key of the account that sent us the session
+    pub sender_key: String,
+    /// The public ed25519 key of the account that sent us the session.
+    pub signing_key: HashMap<String, String>,
+    /// The id of the room that the session is used in.
+    pub room_id: String,
+    /// The list of claimed ed25519 that forwarded us this key. Will be empty if
+    /// we directly received this session.
+    pub forwarding_chains: Vec<String>,
+    /// Flag remembering if the session was directly sent to us by the sender
+    /// or if it was imported.
+    pub imported: bool,
+    /// Flag remembering if the session has been backed up.
+    pub backed_up: bool,
+}
+
+/// Error type for the migration process.
+#[derive(thiserror::Error, Debug)]
+pub enum MigrationError {
+    /// Generic catch all error variant.
+    #[error("error migrating database: {message}")]
+    Generic {
+        /// The error message
+        message: String,
+    },
+}
+
+impl From<anyhow::Error> for MigrationError {
+    fn from(e: anyhow::Error) -> MigrationError {
+        MigrationError::Generic { message: e.to_string() }
+    }
+}
+
+/// TODO
+pub fn migrate(
+    data: MigrationData,
+    path: &str,
+    passphrase: Option<String>,
+) -> Result<(), anyhow::Error> {
+    use matrix_sdk_crypto::store::{Changes as RustChanges, CryptoStore, RecoveryKey};
+    use matrix_sdk_sled::CryptoStore as SledStore;
+    use tokio::runtime::Runtime;
+    use vodozemac::{
+        megolm::InboundGroupSession,
+        olm::{Account, Session},
+        Curve25519PublicKey,
+    };
+
+    let store = SledStore::open_with_passphrase(path, passphrase.as_deref())?;
+    let runtime = Runtime::new()?;
+
+    let user_id: Arc<UserId> = parse_user_id(&data.account.user_id)?.into();
+    let device_id: Box<DeviceId> = data.account.device_id.into();
+    let device_id: Arc<DeviceId> = device_id.into();
+
+    let account = Account::from_libolm_pickle(&data.account.pickle, &data.pickle_key)?;
+    let pickle = account.pickle();
+
+    let identity_keys = Arc::new(account.identity_keys());
+
+    let pickled_account = matrix_sdk_crypto::olm::PickledAccount {
+        user_id: parse_user_id(&data.account.user_id)?,
+        device_id: device_id.as_ref().to_owned(),
+        pickle,
+        shared: data.account.shared,
+        uploaded_signed_key_count: data.account.uploaded_signed_key_count as u64,
+    };
+
+    let account = matrix_sdk_crypto::olm::ReadOnlyAccount::from_pickle(pickled_account)?;
+
+    let mut sessions = Vec::new();
+
+    for session_pickle in data.sessions {
+        let pickle =
+            Session::from_libolm_pickle(&session_pickle.pickle, &data.pickle_key)?.pickle();
+
+        let pickle = matrix_sdk_crypto::olm::PickledSession {
+            pickle,
+            sender_key: Curve25519PublicKey::from_base64(&session_pickle.sender_key)?,
+            created_using_fallback_key: session_pickle.created_using_fallback_key,
+            creation_time: Instant::now(),
+            last_use_time: Instant::now(),
+        };
+
+        let session = matrix_sdk_crypto::olm::Session::from_pickle(
+            user_id.clone(),
+            device_id.clone(),
+            identity_keys.clone(),
+            pickle,
+        );
+
+        sessions.push(session);
+    }
+
+    let mut inbound_group_sessions = Vec::new();
+
+    for session in data.inbound_group_sessions {
+        let pickle =
+            InboundGroupSession::from_libolm_pickle(&session.pickle, &data.pickle_key)?.pickle();
+
+        let pickle = matrix_sdk_crypto::olm::PickledInboundGroupSession {
+            pickle,
+            sender_key: session.sender_key,
+            signing_key: session
+                .signing_key
+                .into_iter()
+                .map(|(k, v)| Ok((DeviceKeyAlgorithm::try_from(k)?, v)))
+                .collect::<Result<_, anyhow::Error>>()?,
+            room_id: RoomId::parse(session.room_id)?,
+            forwarding_chains: session.forwarding_chains,
+            imported: session.imported,
+            backed_up: session.backed_up,
+            history_visibility: None,
+        };
+
+        let session = matrix_sdk_crypto::olm::InboundGroupSession::from_pickle(pickle)?;
+
+        inbound_group_sessions.push(session);
+    }
+
+    let recovery_key =
+        data.backup_recovery_key.map(|k| RecoveryKey::from_base64(k.as_str())).transpose()?;
+
+    let changes = RustChanges {
+        account: Some(account),
+        sessions,
+        inbound_group_sessions,
+        recovery_key,
+        backup_version: data.backup_version,
+        ..Default::default()
+    };
+
+    Ok(runtime.block_on(store.save_changes(changes))?)
+}
 
 /// Callback that will be passed over the FFI to report progress
 pub trait ProgressListener {
@@ -149,8 +337,8 @@ impl From<matrix_sdk_crypto::CrossSigningStatus> for CrossSigningStatus {
     }
 }
 
-fn parse_user_id(user_id: &str) -> Result<Box<ruma::UserId>, CryptoStoreError> {
-    ruma::UserId::parse(user_id).map_err(|e| CryptoStoreError::InvalidUserId(user_id.to_owned(), e))
+fn parse_user_id(user_id: &str) -> Result<Box<UserId>, CryptoStoreError> {
+    UserId::parse(user_id).map_err(|e| CryptoStoreError::InvalidUserId(user_id.to_owned(), e))
 }
 
 #[allow(warnings)]
