@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 pub use sled::Error;
 use sled::{
     transaction::{ConflictableTransactionError, TransactionError},
-    Config, Db, IVec, Transactional, Tree,
+    Batch, Config, Db, IVec, Transactional, Tree,
 };
 use tracing::debug;
 
@@ -730,6 +730,34 @@ impl SledStore {
 
         Ok(request)
     }
+
+    /// Save a batch of tracked users.
+    ///
+    /// # Arguments
+    ///
+    /// * `tracked_users` - A list of tuples, the first element of the tupple is
+    /// the user ID, the second element is if the user should be considered to
+    /// be dirty.
+    pub async fn save_tracked_users(
+        &self,
+        tracked_users: &[(&UserId, bool)],
+    ) -> Result<(), CryptoStoreError> {
+        let users: Vec<TrackedUser> = tracked_users
+            .into_iter()
+            .map(|(u, d)| TrackedUser { user_id: (*u).into(), dirty: *d })
+            .collect();
+
+        let mut batch = Batch::default();
+
+        for user in users {
+            batch.insert(
+                self.encode_key(TRACKED_USERS_TABLE, user.user_id.as_str()),
+                self.serialize_value(&user)?,
+            );
+        }
+
+        self.tracked_users.apply_batch(batch).map_err(|e| CryptoStoreError::Backend(anyhow!(e)))
+    }
 }
 
 #[async_trait]
@@ -932,14 +960,7 @@ impl CryptoStore for SledStore {
             self.users_for_key_query_cache.remove(user);
         }
 
-        let user = TrackedUser { user_id: user.to_owned(), dirty };
-
-        self.tracked_users
-            .insert(
-                self.encode_key(TRACKED_USERS_TABLE, user.user_id.as_str()),
-                self.serialize_value(&user)?,
-            )
-            .map_err(|e| CryptoStoreError::Backend(anyhow!(e)))?;
+        self.save_tracked_users(&[(user, dirty)]).await?;
 
         Ok(already_added)
     }
