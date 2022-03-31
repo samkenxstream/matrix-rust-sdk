@@ -37,14 +37,34 @@ pub use verification::{
     StartSasResult, Verification, VerificationRequest,
 };
 
-/// TODO
+/// Struct collecting data that is important to migrate to the rust-sdk
 pub struct MigrationData {
+    /// The pickled version of the Olm Account
     account: PickledAccount,
+    /// The list of pickleds Olm Sessions.
     sessions: Vec<PickledSession>,
+    /// The list of Megolm inbound group sessions.
     inbound_group_sessions: Vec<PickledInboundGroupSession>,
+    /// The Olm pickle key that was used to pickle all the Olm objects.
     pickle_key: String,
+    /// The backup version that is currently active.
     backup_version: Option<String>,
+    // The backup recovery key, as a base64 encoded string.
     backup_recovery_key: Option<String>,
+    /// The private cross signing keys.
+    cross_signing: CrossSignignKeys,
+    /// The list of users that the Rust SDK should track.
+    tracked_users: Vec<String>,
+}
+
+/// Struct holding the private cross signing keys as base64 encoded strings.
+pub struct CrossSignignKeys {
+    /// The private part of the master key.
+    master_key: Option<String>,
+    /// The private part of the self-signing key.
+    self_signing_key: Option<String>,
+    /// The private part of the user-signing key.
+    user_signing_key: Option<String>,
 }
 
 /// A pickled version of an `Account`.
@@ -123,11 +143,14 @@ impl From<anyhow::Error> for MigrationError {
 
 /// TODO
 pub fn migrate(
-    data: MigrationData,
+    mut data: MigrationData,
     path: &str,
     passphrase: Option<String>,
 ) -> Result<(), anyhow::Error> {
-    use matrix_sdk_crypto::store::{Changes as RustChanges, CryptoStore, RecoveryKey};
+    use matrix_sdk_crypto::{
+        olm::PrivateCrossSigningIdentity,
+        store::{Changes as RustChanges, CryptoStore, RecoveryKey},
+    };
     use matrix_sdk_sled::CryptoStore as SledStore;
     use tokio::runtime::Runtime;
     use vodozemac::{
@@ -135,6 +158,7 @@ pub fn migrate(
         olm::{Account, Session},
         Curve25519PublicKey,
     };
+    use zeroize::Zeroize;
 
     let store = SledStore::open_with_passphrase(path, passphrase.as_deref())?;
     let runtime = Runtime::new()?;
@@ -169,6 +193,8 @@ pub fn migrate(
             sender_key: Curve25519PublicKey::from_base64(&session_pickle.sender_key)?,
             created_using_fallback_key: session_pickle.created_using_fallback_key,
             creation_time: Instant::now(),
+            // TODO pass the last use time from the kotlin side instead of using
+            // last use time.
             last_use_time: Instant::now(),
         };
 
@@ -211,8 +237,31 @@ pub fn migrate(
     let recovery_key =
         data.backup_recovery_key.map(|k| RecoveryKey::from_base64(k.as_str())).transpose()?;
 
+    let cross_signing = PrivateCrossSigningIdentity::empty((*user_id).into());
+    runtime.block_on(cross_signing.import_secrets_unchecked(
+        data.cross_signing.master_key.as_deref(),
+        data.cross_signing.self_signing_key.as_deref(),
+        data.cross_signing.user_signing_key.as_deref(),
+    ))?;
+
+    data.cross_signing.master_key.zeroize();
+    data.cross_signing.self_signing_key.zeroize();
+    data.cross_signing.user_signing_key.zeroize();
+
+    let tracked_users = data
+        .tracked_users
+        .into_iter()
+        .map(|u| Ok(((parse_user_id(&u)?), true)))
+        .collect::<Result<Vec<(Box<UserId>, bool)>, anyhow::Error>>()?;
+
+    let tracked_users: Vec<(&UserId, bool)> =
+        tracked_users.iter().map(|(u, d)| (&**u, *d)).collect();
+
+    runtime.block_on(store.save_tracked_users(tracked_users.as_slice()))?;
+
     let changes = RustChanges {
         account: Some(account),
+        private_identity: Some(cross_signing),
         sessions,
         inbound_group_sessions,
         recovery_key,

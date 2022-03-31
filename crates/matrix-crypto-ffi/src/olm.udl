@@ -439,6 +439,8 @@ dictionary MigrationData {
     string? backup_version;
     string? backup_recovery_key;
     string pickle_key;
+    CrossSignignKeys cross_signing;
+    sequence<string> tracked_users;
 };
 
 dictionary PickledAccount {
@@ -465,4 +467,10 @@ dictionary PickledInboundGroupSession {
     sequence<string> forwarding_chains;
     boolean imported;
     boolean backed_up;
+};
+
+dictionary CrossSignignKeys {
+    string? master_key;
+    string? self_signing_key;
+    string? user_signing_key;
 };
