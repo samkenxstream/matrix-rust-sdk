@@ -494,7 +494,7 @@ impl OutboundGroupSession {
             account_identity_keys: identity_keys,
             session_id: session_id.into(),
             room_id: pickle.room_id,
-            creation_time: pickle.creation_time.into(),
+            creation_time: pickle.creation_time,
             message_count: AtomicU64::from(pickle.message_count).into(),
             shared: AtomicBool::from(pickle.shared).into(),
             invalidated: AtomicBool::from(pickle.invalidated).into(),
